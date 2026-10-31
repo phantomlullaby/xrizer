@@ -5,13 +5,23 @@ use glutin_glx_sys::{
     glx::{self, Glx},
 };
 use libc::{dlerror, dlopen, dlsym};
-use log::warn;
+use log::{info, warn};
 use openvr as vr;
 use openxr as xr;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, LazyLock, Once};
 
 static GLX: LazyLock<Library> = LazyLock::new(|| Library::new(c"libGLX.so.0"));
+static EGL: LazyLock<Library> = LazyLock::new(|| Library::new(c"libEGL.so.1"));
+
+type EglGetProcAddress = xr::sys::platform::EglGetProcAddressMNDX;
+type EglGetCurrent = unsafe extern "C" fn() -> *mut c_void;
+type EglQueryContext = unsafe extern "C" fn(*mut c_void, *mut c_void, i32, *mut i32) -> u32;
+type EglChooseConfig =
+    unsafe extern "C" fn(*mut c_void, *const i32, *mut *mut c_void, i32, *mut i32) -> u32;
+
+const EGL_CONFIG_ID: i32 = 0x3028;
+const EGL_NONE: i32 = 0x3038;
 
 pub struct GlData {
     session_data: Arc<SessionCreateInfo>,
@@ -71,6 +81,61 @@ unsafe fn get_visualid(
     }
 }
 
+/// Session info for an app whose current context is EGL (e.g. SDL on Wayland). Using
+/// XR_MNDX_egl_enable lets Monado sync with a native fence instead of glFinish on every frame.
+unsafe fn egl_session_info() -> Option<xr::opengl::SessionCreateInfo> {
+    unsafe {
+        let get_display: EglGetCurrent = std::mem::transmute(EGL.get(c"eglGetCurrentDisplay"));
+        let get_context: EglGetCurrent = std::mem::transmute(EGL.get(c"eglGetCurrentContext"));
+        let query_context: EglQueryContext = std::mem::transmute(EGL.get(c"eglQueryContext"));
+        let choose_config: EglChooseConfig = std::mem::transmute(EGL.get(c"eglChooseConfig"));
+        let get_proc_address: EglGetProcAddress =
+            std::mem::transmute(EGL.get(c"eglGetProcAddress"));
+
+        let display = get_display();
+        let context = get_context();
+        if display.is_null() || context.is_null() {
+            warn!("Neither a GLX nor an EGL context is current!");
+            return None;
+        }
+
+        // A config id of 0 means the context was made with EGL_KHR_no_config_context.
+        let mut config_id = 0;
+        let mut config = std::ptr::null_mut();
+        if query_context(display, context, EGL_CONFIG_ID, &mut config_id) == 0 {
+            warn!("Failed to get EGL config id from context");
+        } else if config_id != 0 {
+            let attrs = [EGL_CONFIG_ID, config_id, EGL_NONE];
+            let mut count = 0;
+            if choose_config(display, attrs.as_ptr(), &mut config, 1, &mut count) == 0 || count < 1
+            {
+                warn!("Failed to find EGL config {config_id}");
+                config = std::ptr::null_mut();
+            }
+        }
+
+        info!("Using EGL context {context:?} (display {display:?}, config id {config_id})");
+
+        // EGL (unlike GLX) refuses to share a context whose KHR_no_error state differs, and the
+        // runtime's shared context is never no-error, so session creation would fail.
+        const CONTEXT_FLAG_NO_ERROR_BIT: i32 = 0x8;
+        let mut flags = 0;
+        gl::GetIntegerv(gl::CONTEXT_FLAGS, &mut flags);
+        if flags & CONTEXT_FLAG_NO_ERROR_BIT != 0 {
+            warn!(
+                "The app's EGL context is a no-error context; the runtime can't share with it \
+                 (EGL_BAD_MATCH). Create the context without EGL_CONTEXT_OPENGL_NO_ERROR_KHR."
+            );
+        }
+        Some(xr::opengl::SessionCreateInfo::Egl {
+            get_proc_address,
+            display,
+            config,
+            context,
+        })
+    }
+}
+
 impl GlData {
     // Returns None if we couldn't get the display.
     pub(crate) fn new() -> Option<Self> {
@@ -78,12 +143,20 @@ impl GlData {
             let func = unsafe { CString::from_vec_unchecked(func.as_bytes().to_vec()) };
             GLX.get(&func)
         });
+        let use_egl = unsafe { glx.GetCurrentContext() }.is_null();
 
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
             gl::load_with(|f| {
                 let f = unsafe { CString::from_vec_unchecked(f.as_bytes().to_vec()) };
-                unsafe { glx.GetProcAddress(f.as_ptr().cast()) }.cast()
+                if use_egl {
+                    let get_proc_address: EglGetProcAddress =
+                        unsafe { std::mem::transmute(EGL.get(c"eglGetProcAddress")) };
+                    unsafe { get_proc_address(f.as_ptr()) }
+                        .map_or(std::ptr::null(), |p| p as *const c_void)
+                } else {
+                    unsafe { glx.GetProcAddress(f.as_ptr().cast()) }.cast()
+                }
             });
 
             if log::log_enabled!(log::Level::Debug) {
@@ -96,31 +169,35 @@ impl GlData {
 
         // Grab the session info on creation - this makes us resilient against session restarts,
         // which could result in us trying to grab the context from a different thread
-        let session_info = unsafe {
-            let x_display = glx.GetCurrentDisplay();
-            if x_display.is_null() {
-                warn!("X display is null!");
-                return None;
-            }
-            let glx_context = glx.GetCurrentContext();
-            if glx_context.is_null() {
-                warn!("GLX context was null!");
-                return None;
-            }
+        let session_info = if use_egl {
+            unsafe { egl_session_info() }?
+        } else {
+            unsafe {
+                let x_display = glx.GetCurrentDisplay();
+                if x_display.is_null() {
+                    warn!("X display is null!");
+                    return None;
+                }
+                let glx_context = glx.GetCurrentContext();
+                if glx_context.is_null() {
+                    warn!("GLX context was null!");
+                    return None;
+                }
 
-            let glx_drawable = glx.GetCurrentDrawable();
-            let fbconfig = get_fbconfig(&glx, x_display, glx_context);
-            let visualid = get_visualid(&glx, x_display, fbconfig);
+                let glx_drawable = glx.GetCurrentDrawable();
+                let fbconfig = get_fbconfig(&glx, x_display, glx_context);
+                let visualid = get_visualid(&glx, x_display, fbconfig);
 
-            xr::opengl::SessionCreateInfo::Xlib {
-                x_display: x_display.cast(),
-                glx_fb_config: fbconfig.map(|p| p.cast_mut()).unwrap_or_else(|| {
-                    warn!("No fbconfig found.");
-                    1 as _
-                }),
-                visualid: visualid.unwrap_or(1),
-                glx_drawable,
-                glx_context: glx_context.cast_mut(),
+                xr::opengl::SessionCreateInfo::Xlib {
+                    x_display: x_display.cast(),
+                    glx_fb_config: fbconfig.map(|p| p.cast_mut()).unwrap_or_else(|| {
+                        warn!("No fbconfig found.");
+                        1 as _
+                    }),
+                    visualid: visualid.unwrap_or(1),
+                    glx_drawable,
+                    glx_context: glx_context.cast_mut(),
+                }
             }
         };
 

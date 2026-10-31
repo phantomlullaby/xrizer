@@ -128,6 +128,9 @@ impl<C: Compositor> OpenXrData<C> {
         let mut exts = xr::ExtensionSet::default();
         exts.khr_vulkan_enable = supported_exts.khr_vulkan_enable;
         exts.khr_opengl_enable = supported_exts.khr_opengl_enable;
+        // Lets EGL-based GL apps hand their context to the runtime (Monado), which then syncs with
+        // a native fence instead of glFinish.
+        exts.mndx_egl_enable = supported_exts.mndx_egl_enable;
         exts.khr_convert_timespec_time = supported_exts.khr_convert_timespec_time;
         exts.ext_hand_tracking = supported_exts.ext_hand_tracking;
         exts.khr_visibility_mask = supported_exts.khr_visibility_mask;
@@ -563,6 +566,18 @@ impl SessionData {
             .begin(xr::ViewConfigurationType::PRIMARY_STEREO)
             .map_err(SessionCreationError::BeginSessionFailed)?;
         info!("Began OpenXR session.");
+
+        // Lets a launcher pin the headset's refresh rate for this session, e.g. XRIZER_REFRESH_RATE=90
+        // (XR_FB_display_refresh_rate, which runtimes like WiVRn forward to the headset)
+        if let Some(rate) = std::env::var("XRIZER_REFRESH_RATE")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+        {
+            match session.request_display_refresh_rate(rate) {
+                Ok(()) => info!("Requested a display refresh rate of {rate} Hz"),
+                Err(e) => warn!("Could not request a display refresh rate of {rate} Hz: {e}"),
+            }
+        }
 
         Ok((
             SessionData {

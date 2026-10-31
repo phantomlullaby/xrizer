@@ -80,3 +80,7 @@ libloading = "0.8.5"
 test-cdylib = "1.1.0"
 fakexr = { path = "fakexr" }
 macros = { path = "macros", features = ["test"]}
+
+# Vendored openxr 0.22 with an XR_MNDX_egl_enable session binding (SessionCreateInfo::Egl).
+[patch.crates-io]
+openxr = { path = "vendor/openxr" }

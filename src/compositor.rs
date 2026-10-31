@@ -40,6 +40,13 @@ pub struct Compositor {
     timing_mode: Mutex<vr::EVRCompositorTimingMode>,
     frame_state: Mutex<FrameState>,
     focused: Once,
+    /// XRIZER_DEFERRED_END: WaitGetPoses leaves the submitted frame open and hands out poses predicted for the next
+    /// frame; the frame is ended (and the next one waited for and begun) when the app calls PostPresentHandoff during
+    /// the next frame. Ending a frame finishes the app's GL work (glFinish on GLX), so this lets the app queue GPU work
+    /// for the next frame first.
+    deferred_end: bool,
+    /// Display time and views of the submitted frame whose end was deferred
+    pending_end: Mutex<Option<(xr::Time, crate::system::ViewData)>>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -96,6 +103,8 @@ impl Compositor {
             timing_mode: vr::EVRCompositorTimingMode::Implicit.into(),
             frame_state: FrameState::Submitted.into(),
             focused: Once::new(),
+            deferred_end: std::env::var_os("XRIZER_DEFERRED_END").is_some(),
+            pending_end: Mutex::new(None),
         }
     }
 
@@ -123,6 +132,72 @@ impl Compositor {
         self.openxr
             .display_period_nanos
             .store(display_period, Ordering::Relaxed);
+    }
+
+    /// Ends the frame whose end was deferred, then waits for and begins the next one, keeping the runtime's
+    /// wait/begin/end order (its frame pacing relies on it)
+    fn end_pending_frame(&self, session_data: &SessionData) {
+        let Some((display_time, views)) = self.pending_end.lock().unwrap().take() else {
+            return;
+        };
+        self.end_frame_with(session_data, display_time, Some(views));
+        self.maybe_wait_frame(session_data);
+        self.maybe_begin_frame(session_data);
+    }
+
+    fn end_frame_with(
+        &self,
+        session_data: &SessionData,
+        display_time: xr::Time,
+        views: Option<crate::system::ViewData>,
+    ) {
+        #[macros::any_graphics(DynFrameController)]
+        fn end_frame<G: GraphicsBackend + 'static>(
+            ctrl: &mut FrameController<G>,
+            session_data: &SessionData,
+            system: &System,
+            display_time: xr::Time,
+            overlays: Option<&OverlayMan>,
+            views: Option<crate::system::ViewData>,
+        ) where
+            for<'b> &'b crate::overlay::AnySwapchainMap:
+                TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
+        {
+            ctrl.end_frame(session_data, system, display_time, overlays, views)
+        }
+
+        let mut frame_lock = session_data.comp_data.0.lock().unwrap();
+        let Some(ctrl) = frame_lock.as_mut() else {
+            debug!("no frame controller - not presenting frame");
+            return;
+        };
+
+        trace!("presenting frame");
+        let system = self.system.force(|i| System::new(self.openxr.clone(), i));
+        let overlays = self.overlays.get();
+
+        ctrl.with_any_graphics_mut::<end_frame>((
+            session_data,
+            &system,
+            display_time,
+            overlays.as_deref(),
+            views,
+        ));
+        drop(frame_lock);
+
+        self.frame_state
+            .lock()
+            .unwrap()
+            .advance_to(FrameState::Submitted);
+
+        self.metrics.index.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .time
+            .store(self.metrics.system_start.elapsed().as_secs_f64());
+        #[cfg(feature = "tracing")]
+        {
+            tracy_client::frame_mark();
+        }
     }
 
     fn maybe_begin_frame(&self, session_data: &SessionData) {
@@ -285,6 +360,8 @@ impl openxr_data::Compositor for Compositor {
             )),
         );
 
+        // A frame whose end was deferred belonged to the old session
+        self.pending_end.lock().unwrap().take();
         let old_state = std::mem::replace(
             &mut *self.frame_state.lock().unwrap(),
             FrameState::Submitted,
@@ -645,56 +722,20 @@ impl vr::IVRCompositor029_Interface for Compositor {
         true
     }
     fn PostPresentHandoff(&self) {
-        #[macros::any_graphics(DynFrameController)]
-        fn end_frame<G: GraphicsBackend + 'static>(
-            ctrl: &mut FrameController<G>,
-            session_data: &SessionData,
-            system: &System,
-            display_time: xr::Time,
-            overlays: Option<&OverlayMan>,
-        ) where
-            for<'b> &'b crate::overlay::AnySwapchainMap:
-                TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
-        {
-            ctrl.end_frame(session_data, system, display_time, overlays)
-        }
-
         let session_data = self.openxr.session_data.get();
-        let mut frame_lock = session_data.comp_data.0.lock().unwrap();
-        let Some(ctrl) = frame_lock.as_mut() else {
-            debug!("no frame controller - not presenting frame");
+        if self.deferred_end {
+            // Only the frame left open by WaitGetPoses is ended here; the handoff some apps do right after
+            // submitting must not end the frame they are still in
+            self.end_pending_frame(&session_data);
             return;
-        };
+        }
 
         if *self.frame_state.lock().unwrap() != FrameState::Begun {
             return;
         }
 
-        trace!("presenting frame");
-        let system = self.system.force(|i| System::new(self.openxr.clone(), i));
         let display_time = self.openxr.display_time.get();
-        let overlays = self.overlays.get();
-
-        ctrl.with_any_graphics_mut::<end_frame>((
-            &session_data,
-            &system,
-            display_time,
-            overlays.as_deref(),
-        ));
-
-        self.frame_state
-            .lock()
-            .unwrap()
-            .advance_to(FrameState::Submitted);
-
-        self.metrics.index.fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .time
-            .store(self.metrics.system_start.elapsed().as_secs_f64());
-        #[cfg(feature = "tracing")]
-        {
-            tracy_client::frame_mark();
-        }
+        self.end_frame_with(&session_data, display_time, None);
     }
     fn ClearLastSubmittedFrame(&self) {
         crate::warn_unimplemented!("ClearLastSubmittedFrame");
@@ -881,23 +922,51 @@ impl vr::IVRCompositor029_Interface for Compositor {
         {
             let session_data = self.openxr.session_data.get();
             let timing_mode = *self.timing_mode.lock().unwrap();
-            if matches!(
-                timing_mode,
-                vr::EVRCompositorTimingMode::Implicit
-                    | vr::EVRCompositorTimingMode::Explicit_RuntimePerformsPostPresentHandoff
-            ) && *self.frame_state.lock().unwrap() == FrameState::Begun
-            {
-                self.PostPresentHandoff();
-            }
+            let begun = *self.frame_state.lock().unwrap() == FrameState::Begun;
+            if self.deferred_end && timing_mode == vr::EVRCompositorTimingMode::Implicit && begun {
+                if self.pending_end.lock().unwrap().is_some() {
+                    // The app did not hand the previous frame off: end it now, the frame waited for
+                    // back then becomes the current one
+                    self.end_pending_frame(&session_data);
+                } else {
+                    // Keep the submitted frame open, with the views it was rendered with, and hand out
+                    // the poses of the next frame right away
+                    let system = self.system.force(|i| System::new(self.openxr.clone(), i));
+                    let views = system.get_views(session_data.current_origin_as_reference_space());
+                    let display_time = self.openxr.display_time.get();
+                    *self.pending_end.lock().unwrap() = Some((display_time, views));
+                    // The next frame is only waited for once this one has ended; predict its poses one display
+                    // period ahead
+                    let period = self.openxr.display_period_nanos.load(Ordering::Relaxed);
+                    self.openxr
+                        .display_time
+                        .set(xr::Time::from_nanos(display_time.as_nanos() + period));
+                }
+            } else {
+                if matches!(
+                    timing_mode,
+                    vr::EVRCompositorTimingMode::Implicit
+                        | vr::EVRCompositorTimingMode::Explicit_RuntimePerformsPostPresentHandoff
+                ) && begun
+                {
+                    if self.deferred_end {
+                        self.end_pending_frame(&session_data);
+                    }
+                    if *self.frame_state.lock().unwrap() == FrameState::Begun {
+                        let display_time = self.openxr.display_time.get();
+                        self.end_frame_with(&session_data, display_time, None);
+                    }
+                }
 
-            if *self.frame_state.lock().unwrap() == FrameState::Waited {
-                // discard frame
-                self.maybe_begin_frame(&session_data);
-            }
-            self.maybe_wait_frame(&session_data);
+                if *self.frame_state.lock().unwrap() == FrameState::Waited {
+                    // discard frame
+                    self.maybe_begin_frame(&session_data);
+                }
+                self.maybe_wait_frame(&session_data);
 
-            if timing_mode == vr::EVRCompositorTimingMode::Implicit {
-                self.maybe_begin_frame(&session_data);
+                if timing_mode == vr::EVRCompositorTimingMode::Implicit {
+                    self.maybe_begin_frame(&session_data);
+                }
             }
         }
         if let Some(system) = self.system.get() {
@@ -1290,6 +1359,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         system: &System,
         display_time: xr::Time,
         overlays: Option<&OverlayMan>,
+        views: Option<crate::system::ViewData>,
     ) where
         for<'b> &'b crate::overlay::AnySwapchainMap:
             TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
@@ -1305,8 +1375,9 @@ impl<G: GraphicsBackend> FrameController<G> {
                 .as_ref()
                 .expect("Swapchain data unexpectedly invalid on submit");
 
-            let crate::system::ViewData { flags, views } =
-                system.get_views(session_data.current_origin_as_reference_space());
+            let crate::system::ViewData { flags, views } = views.unwrap_or_else(|| {
+                system.get_views(session_data.current_origin_as_reference_space())
+            });
             proj_layer_views = views
                 .into_iter()
                 .enumerate()
