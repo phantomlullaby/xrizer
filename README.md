@@ -4,6 +4,20 @@ xrizer is a reimplementation of OpenVR on top of OpenXR. This enables you to run
 
 Note that xrizer is currently immature. Many things are likely broken, so please open bugs! For a more mature solution, check out [OpenComposite](https://gitlab.com/znixian/OpenComposite), which some of the code in this repo is based on.
 
+# This fork, branch `vr-perf`
+
+This branch adds three opt-in changes, made for Vivecraft with shaders on a Quest 3 over WiVRn. The setup and
+measurements are in [phantomlullaby/minecraft-vr-shaders](https://github.com/phantomlullaby/minecraft-vr-shaders).
+
+- `XRIZER_DEFERRED_END=1` defers the end of each frame. `WaitGetPoses` keeps the submitted frame open and returns poses
+  predicted one display period ahead. The frame is ended, and the next one waited for and begun, when the game calls
+  `PostPresentHandoff` during its next frame. On GLX, ending a frame runs `glFinish`, so a game that hands off after
+  queueing part of its next frame keeps the GPU busy while it waits. The runtime still sees the usual wait, begin, end
+  order. If the game never hands off, the next `WaitGetPoses` ends the frame. Nothing changes without the variable.
+- `XRIZER_REFRESH_RATE=90` requests a display refresh rate through `XR_FB_display_refresh_rate` once the session begins.
+- Sessions for apps whose current context is EGL rather than GLX, through `XR_MNDX_egl_enable`. This uses the openxr crate
+  vendored in `vendor/openxr`, which adds the EGL session binding.
+
 # Download & Usage
 
 [Latest nightly](https://nightly.link/Supreeeme/xrizer/workflows/ci/main/xrizer-nightly-release.zip) - Bleeding edge!
